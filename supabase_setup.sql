@@ -9,8 +9,11 @@ create table documents (
   id bigserial primary key,
   content text, -- corresponds to Document.pageContent
   metadata jsonb, -- corresponds to Document.metadata
-  embedding vector(3072) -- 3072 works for Google's gemini-embedding-2
+  embedding vector(3072), -- 3072 works for Google's gemini-embedding-2
+  fts tsvector generated always as (to_tsvector('english', content)) stored
 );
+
+create index if not exists documents_fts_idx on documents using gin (fts);
 
 -- Create a function to search for documents
 create or replace function match_documents (
@@ -147,3 +150,56 @@ create policy "Users can insert messages into their chats" on public.messages
       where chats.id = messages.chat_id and chats.user_id = auth.uid()
     )
   );
+
+-- Create a function to perform Hybrid Search with RRF (Reciprocal Rank Fusion)
+create or replace function hybrid_search(
+  query_text text,
+  query_embedding vector(3072),
+  match_count int,
+  filter jsonb DEFAULT '{}',
+  full_text_weight float default 1.0,
+  semantic_weight float default 1.0,
+  rrf_k int default 50
+)
+returns table (
+  id bigint,
+  content text,
+  metadata jsonb,
+  similarity float
+)
+language sql
+as $$
+with full_text as (
+  select
+    d.id,
+    row_number() over(order by ts_rank_cd(d.fts, websearch_to_tsquery('english', query_text)) desc) as rank_ix
+  from
+    documents d
+  where
+    d.fts @@ websearch_to_tsquery('english', query_text)
+    and d.metadata @> filter
+),
+semantic as (
+  select
+    d.id,
+    row_number() over (order by d.embedding <=> query_embedding) as rank_ix
+  from
+    documents d
+  where
+    d.metadata @> filter
+)
+select
+  documents.id,
+  documents.content,
+  documents.metadata,
+  (coalesce(1.0 / (rrf_k + full_text.rank_ix), 0.0) * full_text_weight +
+   coalesce(1.0 / (rrf_k + semantic.rank_ix), 0.0) * semantic_weight) as similarity
+from
+  full_text
+  full outer join semantic
+    on full_text.id = semantic.id
+  join documents
+    on coalesce(full_text.id, semantic.id) = documents.id
+order by similarity desc
+limit match_count;
+$$;

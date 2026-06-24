@@ -32,15 +32,16 @@ def get_gemini_embedding(text: str) -> List[float]:
     return data["embedding"]["values"]
 
 def retrieve_context(query: str, metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Query Supabase documents table using match_documents RPC."""
+    """Query Supabase documents table using hybrid_search RPC."""
     try:
         query_embedding = get_gemini_embedding(query)
         params = {
+            "query_text": query,
             "query_embedding": query_embedding,
-            "match_count": 3,
+            "match_count": 6,
             "filter": metadata_filter or {}
         }
-        res = supabase.rpc("match_documents", params).execute()
+        res = supabase.rpc("hybrid_search", params).execute()
         return res.data or []
     except Exception as e:
         print(f"[RAG] Retrieval error: {e}")
