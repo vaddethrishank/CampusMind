@@ -21,6 +21,7 @@ class QueryRequest(BaseModel):
     query: str
     metadata_filter: Optional[Dict[str, Any]] = None
     user_info: Optional[Dict[str, Any]] = None
+    chat_id: Optional[str] = None
 
 # Auth request schemas
 class SignUpRequest(BaseModel):
@@ -43,8 +44,74 @@ class ResetPasswordRequest(BaseModel):
 
 @app.post("/api/chat")
 async def chat(request: QueryRequest):
-    result = get_answer(request.query, metadata_filter=request.metadata_filter, user_info=request.user_info)
+    chat_id = request.chat_id
+    user_id = request.user_info.get("id") if request.user_info else None
+    
+    if not user_id:
+        # Fallback to no history if unauthenticated
+        result = get_answer(request.query, metadata_filter=request.metadata_filter, user_info=request.user_info)
+        return result
+
+    # If no chat_id, create a new chat
+    if not chat_id:
+        title = request.query[:50] + "..." if len(request.query) > 50 else request.query
+        chat_res = supabase.table("chats").insert({"user_id": user_id, "title": title}).execute()
+        chat_id = chat_res.data[0]["id"]
+        chat_title = title
+    else:
+        # Get chat title
+        chat_res = supabase.table("chats").select("title").eq("id", chat_id).execute()
+        chat_title = chat_res.data[0]["title"] if chat_res.data else "Chat"
+
+    # Save user message
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "role": "user",
+        "content": request.query
+    }).execute()
+
+    # Fetch last 6 messages for context (excluding the one just inserted? Wait, I will include it)
+    # Actually, we shouldn't send the current query twice. Let's fetch history BEFORE inserting the current message,
+    # OR fetch last 7 and exclude the last one.
+    # It's cleaner to just fetch history BEFORE saving user message.
+    msg_res = supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("created_at", desc=True).limit(6).execute()
+    
+    # We just saved the user message, so msg_res.data[0] is the current message.
+    # The history we pass to RAG should be everything BEFORE the current message.
+    history_messages = msg_res.data[1:] if msg_res.data else []
+    chat_history = history_messages[::-1]
+
+    # Get answer
+    result = get_answer(request.query, metadata_filter=request.metadata_filter, user_info=request.user_info, chat_history=chat_history)
+    
+    # Save bot message
+    supabase.table("messages").insert({
+        "chat_id": chat_id,
+        "role": "bot",
+        "content": result["answer"]
+    }).execute()
+
+    result["chat_id"] = chat_id
+    result["title"] = chat_title
     return result
+
+@app.get("/api/chats")
+async def get_chats(user_id: str):
+    if not user_id:
+        raise HTTPException(status_code=400, detail="User ID is required")
+    try:
+        res = supabase.table("chats").select("id, title, created_at").eq("user_id", user_id).order("created_at", desc=True).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/chats/{chat_id}/messages")
+async def get_messages(chat_id: str):
+    try:
+        res = supabase.table("messages").select("id, role, content, created_at").eq("chat_id", chat_id).order("created_at", desc=False).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/auth/signup")
 async def signup(req: SignUpRequest):

@@ -73,11 +73,10 @@ function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app-chat-layout">
       <Chat user={user} onLogout={handleLogout} />
     </div>
   );
 }
 
 export default App;
-

@@ -46,7 +46,7 @@ def retrieve_context(query: str, metadata_filter: Optional[Dict[str, Any]] = Non
         print(f"[RAG] Retrieval error: {e}")
         return []
 
-def get_answer(query: str, metadata_filter: Optional[Dict[str, Any]] = None, user_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def get_answer(query: str, metadata_filter: Optional[Dict[str, Any]] = None, user_info: Optional[Dict[str, Any]] = None, chat_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     """Run the simplified RAG pipeline without LangChain dependencies."""
 
     # 1. Retrieve matching documents from Supabase vector store
@@ -85,11 +85,17 @@ Guidelines:
     
     # 4. Generate answer using Groq Chat Completions API
     try:
+        messages = [{"role": "system", "content": system_instruction}]
+        
+        if chat_history:
+            for msg in chat_history:
+                role = "assistant" if msg["role"] == "bot" else "user"
+                messages.append({"role": role, "content": msg["content"]})
+                
+        messages.append({"role": "user", "content": query})
+
         chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": query}
-            ],
+            messages=messages,
             model="llama-3.3-70b-versatile",
             temperature=0.3
         )
