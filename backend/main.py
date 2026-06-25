@@ -1,11 +1,17 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import uvicorn
 import re
+import os
+import time
+import shutil
+from pathlib import Path
 from supabase.client import create_client
 from rag import get_answer, supabase, supabase_url
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from pdf_processor import process_pdf
 
 app = FastAPI()
 
@@ -104,6 +110,14 @@ async def get_chats(user_id: str):
         return res.data
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(chat_id: str):
+    try:
+        supabase.table("chats").delete().eq("id", chat_id).execute()
+        return {"message": "Chat deleted successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/chats/{chat_id}/messages")
 async def get_messages(chat_id: str):
@@ -210,6 +224,106 @@ async def reset_password(req: ResetPasswordRequest):
         return {"message": "Password has been reset successfully."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# ── Admin Document Ingestion Pipeline ──────────────────────────────────────────
+gemini_embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
+
+def _embed_with_retry(texts: List[str], max_retries: int = 5) -> List[List[float]]:
+    """Embed texts with exponential backoff on Gemini rate-limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return gemini_embeddings.embed_documents(texts)
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 15 * (2 ** attempt)
+                print(f"[Upload] Rate limit hit, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Embedding failed after max retries.")
+
+@app.post("/api/admin/upload")
+async def upload_document(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF documents are supported.")
+    
+    pdf_dir = Path("../data/pdfs")
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    file_path = pdf_dir / file.filename
+
+    # Save uploaded file
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
+
+    try:
+        # ── Smart processing: auto-detects text vs tabular PDF ────────────────
+        chunks = process_pdf(str(file_path), source_name=file.filename)
+
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No readable content extracted from PDF.")
+
+        # ── Embed & upload in rate-limit-safe batches ─────────────────────────
+        BATCH_SIZE = 10
+        SLEEP_SECS = 7
+        total_uploaded = 0
+        for i in range(0, len(chunks), BATCH_SIZE):
+            batch = chunks[i:i + BATCH_SIZE]
+            texts = [c["content"] for c in batch]
+            embeddings = _embed_with_retry(texts)
+            rows = [
+                {"content": c["content"], "metadata": c["metadata"], "embedding": emb}
+                for c, emb in zip(batch, embeddings)
+            ]
+            supabase.table("documents").insert(rows).execute()
+            total_uploaded += len(rows)
+            if i + BATCH_SIZE < len(chunks):
+                time.sleep(SLEEP_SECS)
+
+        # Determine content type detected for the response
+        detected_type = chunks[0]["metadata"].get("content_type", "text") if chunks else "text"
+
+        return {
+            "message": f"Successfully ingested '{file.filename}'!",
+            "content_type_detected": detected_type,
+            "chunks_created": total_uploaded
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+
+@app.get("/api/admin/documents")
+async def list_documents():
+    try:
+        res = supabase.table("documents").select("metadata").execute()
+        docs = {}
+        for row in (res.data or []):
+            meta = row.get("metadata") or {}
+            src = meta.get("source")
+            if src:
+                filename = Path(src).name
+                docs[filename] = docs.get(filename, 0) + 1
+        
+        doc_list = [{"filename": k, "chunks": v} for k, v in sorted(docs.items())]
+        return doc_list
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/documents/{filename}")
+async def delete_document(filename: str):
+    try:
+        supabase.table("documents").delete().like("metadata->>source", f"%{filename}").execute()
+
+        file_path = Path("../data/pdfs") / filename
+        if file_path.exists():
+            file_path.unlink()
+
+        return {"message": f"Deleted document '{filename}' successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

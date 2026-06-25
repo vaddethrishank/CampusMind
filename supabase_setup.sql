@@ -1,4 +1,3 @@
--- Enable the pgvector extension to work with embedding vectors
 create extension if not exists vector;
 
 -- Drop the existing table if you ran this before
@@ -14,6 +13,19 @@ create table documents (
 );
 
 create index if not exists documents_fts_idx on documents using gin (fts);
+
+-- RLS: documents table is institutional knowledge (not user-private data).
+-- Enable RLS but allow full access to the service role (backend) and read to everyone.
+alter table documents enable row level security;
+
+drop policy if exists "Service role full access on documents" on documents;
+drop policy if exists "Allow public read on documents" on documents;
+
+-- Backend (service key) can insert/update/delete
+create policy "Service role full access on documents" on documents
+  using (true)
+  with check (true);
+
 
 -- Create a function to search for documents
 create or replace function match_documents (

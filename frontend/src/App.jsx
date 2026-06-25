@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
 import Chat from './Chat';
 import Auth from './Auth';
+import Admin from './Admin';
 import './index.css';
 
 function App() {
   const [user, setUser] = useState(null);
   const [resetToken, setResetToken] = useState(null);
   const [checkingSession, setCheckingSession] = useState(true);
+  const [currentView, setCurrentView] = useState('chat'); // 'chat' or 'admin'
 
   useEffect(() => {
     // Check if there is an active session in local storage
@@ -74,7 +76,11 @@ function App() {
 
   return (
     <div className="app-chat-layout">
-      <Chat user={user} onLogout={handleLogout} />
+      {currentView === 'admin' ? (
+        <Admin onBack={() => setCurrentView('chat')} />
+      ) : (
+        <Chat user={user} onLogout={handleLogout} onOpenAdmin={() => setCurrentView('admin')} />
+      )}
     </div>
   );
 }

@@ -8,7 +8,34 @@ const KNOWN_SOURCES = [
   { label: 'Handbook', value: 'handbook.pdf' },
 ];
 
-export default function Chat({ user, onLogout }) {
+const DEFAULT_NOTIFICATIONS = [
+  {
+    id: 1,
+    title: 'Welcome to CampusMind!',
+    message: 'Your AI assistant is ready. Ask anything about syllabus, notes, or handbooks.',
+    time: 'Just now',
+    unread: true,
+    icon: '🎉'
+  },
+  {
+    id: 2,
+    title: 'Knowledge Base Updated',
+    message: 'Spring 2026 curriculum and handbook PDFs have been indexed.',
+    time: '1h ago',
+    unread: true,
+    icon: '📚'
+  },
+  {
+    id: 3,
+    title: 'Campus Assistant Tips',
+    message: 'You can use document filter chips above to narrow down search results.',
+    time: '1d ago',
+    unread: false,
+    icon: '💡'
+  }
+];
+
+export default function Chat({ user, onLogout, onOpenAdmin }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -17,6 +44,61 @@ export default function Chat({ user, onLogout }) {
   // Chat History State
   const [chatSessions, setChatSessions] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
+
+  // Notification Center State
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [notifFilter, setNotifFilter] = useState('all');
+  const [notifications, setNotifications] = useState(() => {
+    const stored = localStorage.getItem(`campusmind_notifs_${user?.id}`);
+    if (stored !== null) {
+      try {
+        return JSON.parse(stored);
+      } catch (e) {
+        console.error('Failed to parse stored notifications', e);
+      }
+    }
+    return DEFAULT_NOTIFICATIONS;
+  });
+
+  useEffect(() => {
+    if (user?.id) {
+      localStorage.setItem(`campusmind_notifs_${user.id}`, JSON.stringify(notifications));
+    }
+  }, [notifications, user?.id]);
+
+  const notifRef = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (notifRef.current && !notifRef.current.contains(event.target)) {
+        setShowNotifications(false);
+      }
+    };
+    if (showNotifications) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [showNotifications]);
+
+  const unreadCount = notifications.filter(n => n.unread).length;
+  const filteredNotifs = notifFilter === 'all' 
+    ? notifications 
+    : notifications.filter(n => n.unread);
+
+  const markAllRead = () => {
+    setNotifications(prev => prev.map(n => ({ ...n, unread: false })));
+  };
+
+  const toggleRead = (id) => {
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, unread: !n.unread } : n));
+  };
+
+  const deleteNotif = (e, id) => {
+    e.stopPropagation();
+    setNotifications(prev => prev.filter(n => n.id !== id));
+  };
 
   const messagesEndRef = useRef(null);
 
@@ -64,6 +146,23 @@ export default function Chat({ user, onLogout }) {
   const handleNewChat = () => {
     setActiveChatId(null);
     setMessages([]);
+  };
+
+  const handleDeleteChat = async (e, chatId) => {
+    e.stopPropagation();
+    if (!window.confirm("Are you sure you want to delete this chat conversation?")) return;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/chats/${chatId}`, { method: 'DELETE' });
+      if (res.ok) {
+        setChatSessions((prev) => prev.filter((c) => c.id !== chatId));
+        if (activeChatId === chatId) {
+          handleNewChat();
+        }
+      }
+    } catch (err) {
+      console.error("Failed to delete chat", err);
+    }
   };
 
   const handleSubmit = async (e) => {
@@ -125,9 +224,19 @@ export default function Chat({ user, onLogout }) {
   return (
     <>
       <div className="sidebar">
-        <button className="new-chat-btn" onClick={handleNewChat}>
-          + New Chat
-        </button>
+        <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
+          <button className="new-chat-btn" onClick={handleNewChat} style={{ flex: 1, marginBottom: 0 }}>
+            + New Chat
+          </button>
+          <button 
+            type="button" 
+            onClick={onOpenAdmin} 
+            className="admin-nav-btn"
+            title="Institutional Admin Portal"
+          >
+            🛡️ Admin
+          </button>
+        </div>
         <div className="chat-history-list">
           {chatSessions.map((chat) => (
             <div 
@@ -135,12 +244,23 @@ export default function Chat({ user, onLogout }) {
               className={`history-item ${activeChatId === chat.id ? 'active' : ''}`}
               onClick={() => loadChat(chat.id)}
               title={chat.title}
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
             >
-              {chat.title}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {chat.title}
+              </span>
+              <button
+                type="button"
+                className="delete-chat-btn"
+                onClick={(e) => handleDeleteChat(e, chat.id)}
+                title="Delete Chat"
+              >
+                🗑️
+              </button>
             </div>
           ))}
         </div>
-        <div className="user-profile-header" style={{ marginTop: 'auto', borderBottom: 'none', paddingTop: '1rem', borderTop: '1px solid var(--surface-border)' }}>
+        <div className="user-profile-header" style={{ marginTop: 'auto', borderBottom: 'none', paddingTop: '1rem', borderTop: '1px solid var(--surface-border)', position: 'relative' }} ref={notifRef}>
           <div className="user-info">
             <div className="user-avatar">
               {user?.name ? user.name.charAt(0) : '?'}
@@ -149,9 +269,113 @@ export default function Chat({ user, onLogout }) {
               <span className="user-name" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{user?.name || 'User'}</span>
             </div>
           </div>
-          <button onClick={onLogout} className="logout-btn" style={{ padding: '0.5rem' }}>
-            Out
-          </button>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            <button 
+              type="button"
+              className={`notif-bell-btn ${showNotifications ? 'active' : ''}`}
+              onClick={() => setShowNotifications(!showNotifications)}
+              title="Notifications"
+              aria-label="Notification Center"
+            >
+              <svg className="bell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+              </svg>
+              {unreadCount > 0 && (
+                <span className="notif-badge">
+                  <span className="notif-badge-ping"></span>
+                  <span className="notif-badge-dot">{unreadCount}</span>
+                </span>
+              )}
+            </button>
+
+            <button onClick={onLogout} className="logout-btn" style={{ padding: '0.5rem' }}>
+              Out
+            </button>
+          </div>
+
+          {showNotifications && (
+            <div className="notif-popover">
+              <div className="notif-popover-header">
+                <div className="notif-header-top">
+                  <div className="notif-header-title">
+                    <span>Notifications</span>
+                    {unreadCount > 0 && <span className="notif-count-pill">{unreadCount} new</span>}
+                  </div>
+                  {unreadCount > 0 && (
+                    <button type="button" className="notif-mark-read-btn" onClick={markAllRead}>
+                      Mark all read
+                    </button>
+                  )}
+                </div>
+                <div className="notif-tabs">
+                  <button 
+                    type="button" 
+                    className={`notif-tab ${notifFilter === 'all' ? 'active' : ''}`}
+                    onClick={() => setNotifFilter('all')}
+                  >
+                    All ({notifications.length})
+                  </button>
+                  <button 
+                    type="button" 
+                    className={`notif-tab ${notifFilter === 'unread' ? 'active' : ''}`}
+                    onClick={() => setNotifFilter('unread')}
+                  >
+                    Unread ({unreadCount})
+                  </button>
+                </div>
+              </div>
+
+              <div className="notif-list">
+                {filteredNotifs.length === 0 ? (
+                  <div className="notif-empty">
+                    <span style={{ fontSize: '1.5rem' }}>🔕</span>
+                    <span>No notifications</span>
+                    <button 
+                      type="button" 
+                      onClick={(e) => { e.stopPropagation(); setNotifications(DEFAULT_NOTIFICATIONS); }}
+                      style={{ marginTop: '0.6rem', background: 'rgba(59, 130, 246, 0.15)', border: '1px solid rgba(59, 130, 246, 0.4)', color: '#60a5fa', padding: '0.35rem 0.75rem', borderRadius: '6px', fontSize: '0.78rem', cursor: 'pointer', fontWeight: 600, transition: 'all 0.15s' }}
+                    >
+                      🔄 Restore sample alerts
+                    </button>
+                  </div>
+                ) : (
+                  filteredNotifs.map(n => (
+                    <div 
+                      key={n.id} 
+                      className={`notif-item ${n.unread ? 'unread' : ''}`}
+                      onClick={() => toggleRead(n.id)}
+                    >
+                      <div className="notif-item-icon">{n.icon}</div>
+                      <div className="notif-item-body">
+                        <div className="notif-item-title-row">
+                          <span className="notif-item-title">{n.title}</span>
+                          <span className="notif-item-time">{n.time}</span>
+                        </div>
+                        <div className="notif-item-msg">{n.message}</div>
+                      </div>
+                      {n.unread && <div className="notif-unread-dot"></div>}
+                      <button 
+                        type="button" 
+                        className="notif-dismiss-btn" 
+                        onClick={(e) => deleteNotif(e, n.id)}
+                        title="Dismiss"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="notif-popover-footer">
+                <a className="notif-footer-link" onClick={() => { setShowNotifications(false); setInput('Show academic calendar and important notices'); }}>
+                  ✨ Ask AI for Campus Updates
+                </a>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

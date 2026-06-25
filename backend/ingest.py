@@ -1,149 +1,114 @@
+"""
+ingest.py – Batch ingestion script for all PDFs in ../data/pdfs/
+Uses the smart pdf_processor module for auto content-type detection.
+Run: python ingest.py
+"""
 import os
-import pickle
+import sys
 import glob
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from supabase.client import Client, create_client
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import SupabaseVectorStore
-from langchain_community.retrievers import BM25Retriever
 
-# Load environment variables
+from pdf_processor import process_pdf
+
 load_dotenv(dotenv_path="../.env")
 
-# ── 1. Supabase Client ────────────────────────────────────────────────────────
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
 
 if not supabase_url or not supabase_key:
-    print("❌ Error: SUPABASE_URL or SUPABASE_SERVICE_KEY is missing from .env")
-    exit(1)
+    print("ERROR: SUPABASE_URL or SUPABASE_SERVICE_KEY is missing from .env")
+    sys.exit(1)
 
 supabase: Client = create_client(supabase_url, supabase_key)
 
-# ── 2. Embeddings ─────────────────────────────────────────────────────────────
-print("🔧 Initializing Google Embeddings (models/gemini-embedding-2)...")
+print("Initializing Google Gemini Embeddings...")
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
 
-# ── 3. Text Splitter ──────────────────────────────────────────────────────────
-# chunk_size=800 and chunk_overlap=150 produces more chunks with better context
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=800,
-    chunk_overlap=150,
-    length_function=len,
-    separators=["\n\n", "\n", ".", " ", ""]
-)
+
+def embed_with_retry(texts: list[str], max_retries: int = 5) -> list:
+    for attempt in range(max_retries):
+        try:
+            return embeddings.embed_documents(texts)
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 15 * (2 ** attempt)
+                print(f"  Rate limit hit — waiting {wait}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Embedding failed after max retries.")
 
 
-def load_pdfs_individually(pdf_dir: str):
-    """Load each PDF one at a time and show per-file progress."""
-    pdf_files = sorted(glob.glob(os.path.join(pdf_dir, "**/*.pdf"), recursive=True) +
-                       glob.glob(os.path.join(pdf_dir, "*.pdf")))
+def ingest_all():
+    pdf_dir = "../data/pdfs"
+    pdf_files = sorted(set(glob.glob(os.path.join(pdf_dir, "**/*.pdf"), recursive=True)))
 
     if not pdf_files:
-        print(f"❌ No PDF files found in '{pdf_dir}'")
-        return []
-
-    print(f"\n📂 Found {len(pdf_files)} PDF file(s) in '{pdf_dir}':")
-    for i, f in enumerate(pdf_files, 1):
-        print(f"   {i}. {Path(f).name}")
-
-    all_docs = []
-    for i, pdf_path in enumerate(pdf_files, 1):
-        filename = Path(pdf_path).name
-        try:
-            print(f"\n[{i}/{len(pdf_files)}] Loading: {filename}")
-            loader = PyPDFLoader(pdf_path)
-            pages = loader.load()
-            if not pages:
-                print(f"   ⚠️  No text extracted from {filename} (possibly scanned/image PDF)")
-                continue
-            # Filter out pages with very little content
-            valid_pages = [p for p in pages if len(p.page_content.strip()) > 50]
-            skipped = len(pages) - len(valid_pages)
-            print(f"   ✅ Loaded {len(valid_pages)} pages ({skipped} pages skipped — too short/empty)")
-            all_docs.extend(valid_pages)
-        except Exception as e:
-            print(f"   ❌ Failed to load {filename}: {e}")
-
-    return all_docs
-
-
-def ingest_pdfs():
-    pdf_dir = "../data/pdfs"
-    print("=" * 60)
-    print("🚀 Starting PDF Ingestion Pipeline")
-    print("=" * 60)
-
-    # ── Step 1: Load PDFs ────────────────────────────────────────
-    print("\n📖 STEP 1: Loading PDFs...")
-    all_docs = load_pdfs_individually(pdf_dir)
-
-    if not all_docs:
-        print("❌ No documents loaded. Exiting.")
+        print(f"ERROR: No PDF files found in '{pdf_dir}'")
         return
 
-    total_pages = len(all_docs)
-    total_chars = sum(len(d.page_content) for d in all_docs)
-    print(f"\n📊 Total pages loaded  : {total_pages}")
-    print(f"📊 Total characters    : {total_chars:,}")
-
-    # ── Step 2: Chunking ─────────────────────────────────────────
-    print("\n✂️  STEP 2: Splitting text into chunks...")
-    print(f"   chunk_size={text_splitter._chunk_size}, chunk_overlap={text_splitter._chunk_overlap}")
-    all_splits = text_splitter.split_documents(all_docs)
-    print(f"   ✅ Created {len(all_splits)} chunks from {total_pages} pages")
-
-    # Show per-source chunk breakdown
-    source_counts: dict = {}
-    for chunk in all_splits:
-        src = Path(chunk.metadata.get("source", "unknown")).name
-        source_counts[src] = source_counts.get(src, 0) + 1
-    print("\n   Chunks per PDF:")
-    for src, count in sorted(source_counts.items()):
-        print(f"      {src}: {count} chunks")
-
-    # ── Step 3: Upload to Supabase ───────────────────────────────
-    print(f"\n☁️  STEP 3: Uploading {len(all_splits)} chunks to Supabase...")
-    print("   (This may take a while — embedding each chunk via Google API)")
-
-    BATCH_SIZE = 50
-    total_batches = (len(all_splits) + BATCH_SIZE - 1) // BATCH_SIZE
-
-    for batch_num in range(total_batches):
-        start = batch_num * BATCH_SIZE
-        end = min(start + BATCH_SIZE, len(all_splits))
-        batch = all_splits[start:end]
-        print(f"   📤 Uploading batch {batch_num + 1}/{total_batches} (chunks {start + 1}–{end})...", end="", flush=True)
-        try:
-            SupabaseVectorStore.from_documents(
-                batch,
-                embeddings,
-                client=supabase,
-                table_name="documents",
-                query_name="match_documents"
-            )
-            print(" ✅")
-        except Exception as e:
-            print(f" ❌ FAILED: {e}")
-
-    # ── Step 4: BM25 Index ───────────────────────────────────────
-    print("\n🔍 STEP 4: Building BM25 keyword index for Hybrid Search...")
-    bm25_retriever = BM25Retriever.from_documents(all_splits)
-    bm25_path = "../data/bm25_retriever.pkl"
-    with open(bm25_path, "wb") as f:
-        pickle.dump(bm25_retriever, f)
-    print(f"   ✅ BM25 index saved to '{bm25_path}'")
-
-    # ── Done ─────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("✅ INGESTION COMPLETE!")
-    print(f"   Total chunks in Supabase: {len(all_splits)}")
-    print("   You can now start the FastAPI server with: python main.py")
+    print("CAMPUSMIND BATCH INGESTION PIPELINE")
+    print("=" * 60)
+    print(f"\nFound {len(pdf_files)} PDF file(s):")
+    for i, f in enumerate(pdf_files, 1):
+        print(f"  {i}. {Path(f).name}")
+
+    total_chunks_all = 0
+
+    for pdf_path in pdf_files:
+        filename = Path(pdf_path).name
+        print(f"\n{'─' * 50}")
+        print(f"Processing: {filename}")
+
+        try:
+            # Auto-detect content type and produce chunks
+            chunks = process_pdf(pdf_path, source_name=filename)
+
+            if not chunks:
+                print(f"  WARNING: No content extracted from '{filename}' (possibly scanned image PDF)")
+                continue
+
+            content_type = chunks[0]["metadata"].get("content_type", "text")
+            print(f"  Content type detected: {content_type}")
+            print(f"  Total chunks: {len(chunks)}")
+
+            # Embed & upload with rate-limit protection
+            BATCH_SIZE = 10
+            SLEEP_SECS = 7
+            uploaded = 0
+            total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+
+            for i in range(0, len(chunks), BATCH_SIZE):
+                batch = chunks[i:i + BATCH_SIZE]
+                texts = [c["content"] for c in batch]
+                batch_embs = embed_with_retry(texts)
+                rows = [
+                    {"content": c["content"], "metadata": c["metadata"], "embedding": emb}
+                    for c, emb in zip(batch, batch_embs)
+                ]
+                supabase.table("documents").insert(rows).execute()
+                uploaded += len(rows)
+                batch_num = i // BATCH_SIZE + 1
+                print(f"  Batch {batch_num}/{total_batches}: {uploaded}/{len(chunks)} uploaded")
+                if i + BATCH_SIZE < len(chunks):
+                    time.sleep(SLEEP_SECS)
+
+            print(f"  DONE: {uploaded} chunks indexed for '{filename}'")
+            total_chunks_all += uploaded
+
+        except Exception as e:
+            print(f"  ERROR processing '{filename}': {e}")
+
+    print("\n" + "=" * 60)
+    print("INGESTION COMPLETE")
+    print(f"  Total chunks indexed across all PDFs: {total_chunks_all}")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    ingest_pdfs()
+    ingest_all()
