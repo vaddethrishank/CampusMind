@@ -4,6 +4,7 @@ CampusMind is an AI-powered student information assistant designed to provide ac
 
 ## Features
 - **Student Authentication:** Secure login and sign-up flows using Supabase Auth. Students register with their unique 7-digit Scholar ID, Name, Email, and Username.
+- **Agentic Notice Workflows:** Auto-classification of documents uploaded by admins. Extracts scholar IDs to send personalized in-app notifications (Targeted/Broadcast). Also provides a text-based Notice posting interface which embeds to the vector store.
 - **Intelligent Hybrid Search:** Uses Reciprocal Rank Fusion (RRF) to combine semantic vector search (Google Gemini embeddings) with exact-keyword full-text search (PostgreSQL tsvector) for incredibly accurate document retrieval.
 - **Persistent Chat Sessions:** ChatGPT-style memory! Conversations are saved to the database. The AI seamlessly maintains contextual history (sliding window) across follow-up questions without expensive summarization steps.
 - **Personalized Context:** Identifies the logged-in student to seamlessly answer personalized queries (e.g., "What is my Scholar ID?").

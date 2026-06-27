@@ -12,6 +12,17 @@ from supabase.client import create_client
 from rag import get_answer, supabase, supabase_url
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from pdf_processor import process_pdf
+from notice_agent import (
+    classify_document,
+    extract_scholar_ids,
+    craft_notification,
+    resolve_scholar_ids,
+    get_all_students,
+    dispatch_notifications,
+    chunk_notice_text,
+    NOTICE_ICONS,
+    NOTIFY_TYPES,
+)
 
 app = FastAPI()
 
@@ -47,6 +58,10 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     access_token: str
     password: str
+
+class NoticeRequest(BaseModel):
+    title: str
+    content: str
 
 @app.post("/api/chat")
 async def chat(request: QueryRequest):
@@ -285,10 +300,74 @@ async def upload_document(file: UploadFile = File(...)):
         # Determine content type detected for the response
         detected_type = chunks[0]["metadata"].get("content_type", "text") if chunks else "text"
 
+        # ── AGENTIC LAYER: classify → extract → notify ─────────────────────
+        agent_result = {"notified": 0, "doc_type": "general", "skipped": False}
+        try:
+            # Stage 1: Classify using ONLY first 300 chars of first chunk + filename
+            first_excerpt = chunks[0]["content"][:300] if chunks else ""
+            classification = classify_document(first_excerpt, file.filename)
+            doc_type = classification.get("doc_type", "general")
+            summary = classification.get("summary", file.filename)
+            is_targeted = classification.get("is_targeted", False)
+            agent_result["doc_type"] = doc_type
+
+            print(f"[Agent] '{file.filename}' classified as: {doc_type} | targeted: {is_targeted}")
+
+            if doc_type in NOTIFY_TYPES:
+                # Stage 2: Regex extract scholar IDs from all chunks — zero LLM cost
+                all_texts = [c["content"] for c in chunks]
+                found_ids = extract_scholar_ids(all_texts)
+                is_broadcast = len(found_ids) == 0
+
+                print(f"[Agent] Scholar IDs found via regex: {found_ids or 'none (broadcast)'}") 
+
+                # Stage 3: Single LLM call with minimal context to craft notification
+                notif = craft_notification(doc_type, summary, is_broadcast)
+
+                # Resolve users
+                if is_broadcast:
+                    users = get_all_students(supabase)
+                else:
+                    users = resolve_scholar_ids(found_ids, supabase)
+
+                # Save notice record
+                notice_insert = supabase.table("notices").insert({
+                    "title":          file.filename,
+                    "content":        summary,
+                    "notice_type":    doc_type,
+                    "source_type":    "pdf",
+                    "source_file":    file.filename,
+                    "scholar_ids":    found_ids,
+                    "is_broadcast":   is_broadcast,
+                    "notified_count": len(users),
+                }).execute()
+                notice_id = notice_insert.data[0]["id"]
+
+                # Dispatch notifications
+                sent = dispatch_notifications(
+                    notice_id, users,
+                    notif["title"], notif["message_template"],
+                    supabase
+                )
+                agent_result["notified"] = sent
+                print(f"[Agent] Notifications dispatched: {sent}")
+            else:
+                agent_result["skipped"] = True
+                print(f"[Agent] doc_type='{doc_type}' → no notification needed")
+
+        except Exception as agent_err:
+            # Agent failure must NOT break the main upload response
+            print(f"[Agent] Pipeline error (non-fatal): {agent_err}")
+
         return {
             "message": f"Successfully ingested '{file.filename}'!",
             "content_type_detected": detected_type,
-            "chunks_created": total_uploaded
+            "chunks_created": total_uploaded,
+            "agent": {
+                "doc_type":         agent_result["doc_type"],
+                "notifications_sent": agent_result["notified"],
+                "notification_skipped": agent_result["skipped"],
+            }
         }
     except HTTPException:
         raise
@@ -324,6 +403,145 @@ async def delete_document(filename: str):
         return {"message": f"Deleted document '{filename}' successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Workflow B: Admin Text Notice ───────────────────────────────────────────────
+
+@app.post("/api/admin/notices")
+async def post_notice(req: NoticeRequest):
+    """Admin posts a text notice. Agent extracts scholar IDs, dispatches notifications,
+    and ingests notice into RAG documents table."""
+    if not req.title.strip() or not req.content.strip():
+        raise HTTPException(status_code=400, detail="Title and content are required.")
+
+    try:
+        # Stage 1: Single LLM call on full notice text (it's short, so this is fine)
+        from notice_agent import classify_document, extract_scholar_ids, craft_notification
+        classification = classify_document(req.content[:600], req.title)
+        doc_type = classification.get("doc_type", "student_notice")
+        summary  = classification.get("summary", req.title)
+
+        # Stage 2: Regex extract scholar IDs from notice content
+        found_ids = extract_scholar_ids([req.content])
+        is_broadcast = len(found_ids) == 0
+
+        # Stage 3: Craft notification
+        notif = craft_notification(doc_type, summary, is_broadcast)
+
+        # Resolve users
+        if is_broadcast:
+            users = get_all_students(supabase)
+        else:
+            users = resolve_scholar_ids(found_ids, supabase)
+
+        not_found_ids = [sid for sid in found_ids if sid not in {u["scholar_id"] for u in users}]
+
+        # Persist notice
+        notice_insert = supabase.table("notices").insert({
+            "title":          req.title,
+            "content":        req.content,
+            "notice_type":    doc_type,
+            "source_type":    "text",
+            "scholar_ids":    found_ids,
+            "is_broadcast":   is_broadcast,
+            "notified_count": len(users),
+        }).execute()
+        notice_id = notice_insert.data[0]["id"]
+
+        # Dispatch in-app notifications
+        sent = dispatch_notifications(
+            notice_id, users,
+            notif["title"], notif["message_template"],
+            supabase
+        )
+
+        # ── RAG Ingestion: chunk + embed notice into documents table ──────────
+        rag_chunks = chunk_notice_text(req.title, req.content, notice_id, doc_type)
+        rag_texts = [c["content"] for c in rag_chunks]
+        rag_embeddings = _embed_with_retry(rag_texts)
+        rag_rows = [
+            {"content": c["content"], "metadata": c["metadata"], "embedding": emb}
+            for c, emb in zip(rag_chunks, rag_embeddings)
+        ]
+        supabase.table("documents").insert(rag_rows).execute()
+
+        return {
+            "message":         "Notice posted and notifications dispatched.",
+            "notice_id":       notice_id,
+            "notice_type":     doc_type,
+            "icon":            NOTICE_ICONS.get(doc_type, "📄"),
+            "is_broadcast":    is_broadcast,
+            "students_notified": sent,
+            "scholar_ids_found": found_ids,
+            "scholar_ids_not_found": not_found_ids,
+            "rag_chunks_indexed": len(rag_rows),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Notice pipeline failed: {str(e)}")
+
+
+@app.get("/api/admin/notices-list")
+async def list_notices():
+    """Return all notices for the admin panel."""
+    try:
+        res = supabase.table("notices").select("*").order("created_at", desc=True).limit(50).execute()
+        return res.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── User Notification Endpoints ────────────────────────────────────────────────
+
+@app.get("/api/notifications")
+async def get_notifications(user_id: str):
+    """Fetch all notifications for a specific user (newest first)."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        res = (
+            supabase.table("user_notifications")
+            .select("id, notice_id, notification_title, notification_message, is_read, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+        # Enrich with notice type for icon display
+        notifications = res.data or []
+        if notifications:
+            notice_ids = list({n["notice_id"] for n in notifications if n["notice_id"]})
+            notice_res = supabase.table("notices").select("id, notice_type").in_("id", notice_ids).execute()
+            type_map = {n["id"]: n["notice_type"] for n in (notice_res.data or [])}
+            for notif in notifications:
+                ntype = type_map.get(notif["notice_id"], "general")
+                notif["notice_type"] = ntype
+                notif["icon"] = NOTICE_ICONS.get(ntype, "📄")
+        return notifications
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/notifications/{notif_id}/read")
+async def mark_notification_read(notif_id: str):
+    """Mark a single notification as read."""
+    try:
+        supabase.table("user_notifications").update({"is_read": True}).eq("id", notif_id).execute()
+        return {"message": "Notification marked as read."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/notifications/read-all")
+async def mark_all_notifications_read(user_id: str):
+    """Mark all notifications as read for a user."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        supabase.table("user_notifications").update({"is_read": True}).eq("user_id", user_id).eq("is_read", False).execute()
+        return {"message": "All notifications marked as read."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

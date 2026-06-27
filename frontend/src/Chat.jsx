@@ -8,33 +8,6 @@ const KNOWN_SOURCES = [
   { label: 'Handbook', value: 'handbook.pdf' },
 ];
 
-const DEFAULT_NOTIFICATIONS = [
-  {
-    id: 1,
-    title: 'Welcome to CampusMind!',
-    message: 'Your AI assistant is ready. Ask anything about syllabus, notes, or handbooks.',
-    time: 'Just now',
-    unread: true,
-    icon: '🎉'
-  },
-  {
-    id: 2,
-    title: 'Knowledge Base Updated',
-    message: 'Spring 2026 curriculum and handbook PDFs have been indexed.',
-    time: '1h ago',
-    unread: true,
-    icon: '📚'
-  },
-  {
-    id: 3,
-    title: 'Campus Assistant Tips',
-    message: 'You can use document filter chips above to narrow down search results.',
-    time: '1d ago',
-    unread: false,
-    icon: '💡'
-  }
-];
-
 export default function Chat({ user, onLogout, onOpenAdmin }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -48,23 +21,49 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
   // Notification Center State
   const [showNotifications, setShowNotifications] = useState(false);
   const [notifFilter, setNotifFilter] = useState('all');
-  const [notifications, setNotifications] = useState(() => {
-    const stored = localStorage.getItem(`campusmind_notifs_${user?.id}`);
-    if (stored !== null) {
-      try {
-        return JSON.parse(stored);
-      } catch (e) {
-        console.error('Failed to parse stored notifications', e);
-      }
-    }
-    return DEFAULT_NOTIFICATIONS;
-  });
+  const [notifications, setNotifications] = useState([]);
+  const [notifLoading, setNotifLoading] = useState(false);
+  const notifPollRef = useRef(null);
 
-  useEffect(() => {
-    if (user?.id) {
-      localStorage.setItem(`campusmind_notifs_${user.id}`, JSON.stringify(notifications));
+  // Fetch notifications from the DB
+  const fetchNotifications = async () => {
+    if (!user?.id) return;
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/notifications?user_id=${user.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        // Map DB shape to component shape
+        setNotifications(data.map(n => ({
+          id:      n.id,
+          title:   n.notification_title,
+          message: n.notification_message,
+          time:    formatNotifTime(n.created_at),
+          unread:  !n.is_read,
+          icon:    n.icon || '📢',
+        })));
+      }
+    } catch (e) {
+      console.error('Failed to fetch notifications', e);
     }
-  }, [notifications, user?.id]);
+  };
+
+  const formatNotifTime = (iso) => {
+    if (!iso) return '';
+    const diff = Date.now() - new Date(iso).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'Just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+  };
+
+  // Initial fetch + 30s polling
+  useEffect(() => {
+    fetchNotifications();
+    notifPollRef.current = setInterval(fetchNotifications, 30000);
+    return () => clearInterval(notifPollRef.current);
+  }, [user?.id]);
 
   const notifRef = useRef(null);
 
@@ -87,16 +86,34 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
     ? notifications 
     : notifications.filter(n => n.unread);
 
-  const markAllRead = () => {
+  const markAllRead = async () => {
+    // Optimistic UI update
     setNotifications(prev => prev.map(n => ({ ...n, unread: false })));
+    try {
+      await fetch(`http://127.0.0.1:8000/api/notifications/read-all?user_id=${user.id}`, { method: 'PATCH' });
+    } catch (e) {
+      console.error('Failed to mark all read', e);
+    }
   };
 
-  const toggleRead = (id) => {
+  const toggleRead = async (id) => {
+    const notif = notifications.find(n => n.id === id);
+    if (!notif) return;
+    // Optimistic update
     setNotifications(prev => prev.map(n => n.id === id ? { ...n, unread: !n.unread } : n));
+    // Only call API to mark as read (we don't support un-read via API)
+    if (notif.unread) {
+      try {
+        await fetch(`http://127.0.0.1:8000/api/notifications/${id}/read`, { method: 'PATCH' });
+      } catch (e) {
+        console.error('Failed to mark notification read', e);
+      }
+    }
   };
 
   const deleteNotif = (e, id) => {
     e.stopPropagation();
+    // Only remove from local state (no delete API needed — just hide it)
     setNotifications(prev => prev.filter(n => n.id !== id));
   };
 
