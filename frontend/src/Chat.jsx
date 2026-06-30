@@ -13,6 +13,13 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [selectedSource, setSelectedSource] = useState(null);
+
+  // Complaint state
+  const [complaintPending, setComplaintPending] = useState(null); // {text, category, title}
+  const [complaintSubmitting, setComplaintSubmitting] = useState(false);
+  const [complaintResult, setComplaintResult] = useState(null);   // submitted complaint result
+  const [votedComplaints, setVotedComplaints] = useState(new Set()); // complaint IDs already voted on
+
   
   // Chat History State
   const [chatSessions, setChatSessions] = useState([]);
@@ -186,18 +193,43 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
     e.preventDefault();
     if (!input.trim()) return;
 
-    const userMessage = { role: 'user', content: input };
+    const inputText = input; // capture before clearing
+    const userMessage = { role: 'user', content: inputText };
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
     setIsLoading(true);
+    // Clear previous complaint banner on new message
+    setComplaintPending(null);
+    setComplaintResult(null);
 
     const metadata_filter = selectedSource ? { source: selectedSource } : null;
 
+    // ── Fire-and-forget complaint classify (PARALLEL — does NOT block chat) ──
+    // Never awaited. The chat answer renders at full speed regardless.
+    if (user?.id) {
+      fetch('http://127.0.0.1:8000/api/complaint/classify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: inputText, user_info: user }),
+      })
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (data?.is_complaint && data.confidence >= 0.6) {
+            setComplaintPending({
+              text:     inputText,
+              category: data.category || 'general',
+              title:    data.title    || inputText.slice(0, 60),
+            });
+          }
+        })
+        .catch(() => {}); // silently ignore classify errors
+    }
+
     try {
-      const payload = { 
-        query: input, 
-        metadata_filter, 
-        user_info: user 
+      const payload = {
+        query: inputText,
+        metadata_filter,
+        user_info: user,
       };
       if (activeChatId) {
         payload.chat_id = activeChatId;
@@ -237,6 +269,52 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
       setIsLoading(false);
     }
   };
+
+  // ── Submit complaint when user clicks the banner ──────────────────────────
+  const handleSubmitComplaint = async () => {
+    if (!complaintPending || complaintSubmitting) return;
+    setComplaintSubmitting(true);
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/complaint', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: complaintPending.text, user_info: user }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Submission failed');
+      setComplaintResult(data);
+      setComplaintPending(null);
+    } catch (err) {
+      setComplaintResult({ error: err.message });
+      setComplaintPending(null);
+    } finally {
+      setComplaintSubmitting(false);
+    }
+  };
+
+  // ── Vote on a similar complaint ───────────────────────────────────────────
+  const handleVote = async (complaintId) => {
+    if (votedComplaints.has(complaintId)) return;
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/complaint/${complaintId}/vote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: '', user_info: user }),
+      });
+      if (res.ok) {
+        setVotedComplaints(prev => new Set([...prev, complaintId]));
+        setComplaintResult(prev => prev ? ({
+          ...prev,
+          similar: (prev.similar || []).map(s =>
+            s.id === complaintId ? { ...s, vote_count: s.vote_count + 1 } : s
+          ),
+        }) : prev);
+      }
+    } catch (err) {
+      console.error('Vote error:', err);
+    }
+  };
+
 
   return (
     <>
@@ -458,8 +536,104 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
                 <div className="message bot loading">Thinking...</div>
               </div>
             )}
+
+            {/* ── Complaint Banner: shown when classify detects a complaint ── */}
+            {complaintPending && !complaintResult && (
+              <div className="complaint-banner">
+                <div className="complaint-banner-header">
+                  <span className="complaint-banner-icon">🚨</span>
+                  <div style={{ flex: 1 }}>
+                    <div className="complaint-banner-title">Looks like a complaint</div>
+                    <div className="complaint-banner-sub">
+                      <span className="complaint-category-pill">{complaintPending.category}</span>
+                      {complaintPending.title && (
+                        <span style={{ opacity: 0.7, fontSize: '0.82rem' }}>"{complaintPending.title}"</span>
+                      )}
+                    </div>
+                  </div>
+                  <button type="button" className="complaint-dismiss-btn" onClick={() => setComplaintPending(null)}>×</button>
+                </div>
+                <p className="complaint-banner-msg">
+                  Would you like to formally submit this as a complaint? Admin will review and respond.
+                </p>
+                <div className="complaint-banner-actions">
+                  <button
+                    type="button"
+                    className="complaint-submit-btn"
+                    onClick={handleSubmitComplaint}
+                    disabled={complaintSubmitting}
+                  >
+                    {complaintSubmitting ? '⏳ Submitting…' : '📝 Submit Complaint'}
+                  </button>
+                  <button type="button" className="complaint-cancel-btn" onClick={() => setComplaintPending(null)}>
+                    Not a complaint
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* ── Complaint Success Card ─────────────────────────────────── */}
+            {complaintResult && !complaintResult.error && (
+              <div className="complaint-success-card">
+                <div className="complaint-success-header">
+                  <span style={{ fontSize: '1.3rem' }}>✅</span>
+                  <div style={{ flex: 1 }}>
+                    <div className="complaint-success-title">Complaint Submitted</div>
+                    <div className="complaint-success-sub">{complaintResult.title}</div>
+                  </div>
+                  <button type="button" className="complaint-dismiss-btn" onClick={() => setComplaintResult(null)}>×</button>
+                </div>
+
+                {/* Similar complaints with vote buttons */}
+                {complaintResult.similar && complaintResult.similar.length > 0 && (
+                  <div className="complaint-similar-section">
+                    <div className="complaint-similar-title">👥 Similar open complaints — add your vote:</div>
+                    {complaintResult.similar.slice(0, 3).map(s => (
+                      <div key={s.id} className="complaint-similar-item">
+                        <div className="complaint-similar-text">
+                          <span className="complaint-similar-label">{s.title}</span>
+                          <span className="complaint-vote-count">👥 {s.vote_count}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className={`complaint-vote-btn ${votedComplaints.has(s.id) ? 'voted' : ''}`}
+                          onClick={() => handleVote(s.id)}
+                          disabled={votedComplaints.has(s.id)}
+                        >
+                          {votedComplaints.has(s.id) ? '✓ Voted' : '+1 Same issue'}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Hostel details if enriched */}
+                {complaintResult.hostel_details && Object.keys(complaintResult.hostel_details).length > 1 && (
+                  <div className="complaint-hostel-details">
+                    <div className="complaint-hostel-title">🏠 Your hostel details (auto-fetched):</div>
+                    <div className="complaint-hostel-grid">
+                      {Object.entries(complaintResult.hostel_details)
+                        .filter(([k]) => !['raw_chunk', 'source_doc'].includes(k))
+                        .slice(0, 6)
+                        .map(([k, v]) => (
+                          <div key={k} className="complaint-hostel-item">
+                            <span className="complaint-hostel-key">{k.replace(/_/g, ' ')}</span>
+                            <span className="complaint-hostel-val">{v}</span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {complaintResult?.error && (
+              <div className="complaint-error-toast">⚠️ {complaintResult.error}</div>
+            )}
+
             <div ref={messagesEndRef} />
           </div>
+
 
           <form className="chat-input-form" onSubmit={handleSubmit}>
             <input

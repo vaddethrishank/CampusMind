@@ -12,7 +12,7 @@ const NOTICE_TYPE_LABELS = {
 };
 
 export default function Admin({ onBack }) {
-  const [activeTab, setActiveTab] = useState('upload'); // 'upload' | 'notice'
+  const [activeTab, setActiveTab] = useState('upload'); // 'upload' | 'notice' | 'complaints'
 
   // ── Upload PDF state ───────────────────────────────────────────────────────
   const [documents, setDocuments] = useState([]);
@@ -33,9 +33,17 @@ export default function Admin({ onBack }) {
   const [postedNotices, setPostedNotices] = useState([]);
   const [isLoadingNotices, setIsLoadingNotices] = useState(false);
 
+  // ── Complaints state ───────────────────────────────────────────────────────
+  const [complaints, setComplaints] = useState([]);
+  const [isLoadingComplaints, setIsLoadingComplaints] = useState(false);
+  const [complaintStatusFilter, setComplaintStatusFilter] = useState('');
+  const [complaintCategoryFilter, setComplaintCategoryFilter] = useState('');
+  const [updatingComplaintId, setUpdatingComplaintId] = useState(null);
+
   useEffect(() => {
     fetchDocuments();
     fetchPostedNotices();
+    fetchComplaints();
   }, []);
 
   // ── Fetch functions ────────────────────────────────────────────────────────
@@ -60,6 +68,46 @@ export default function Admin({ onBack }) {
       console.error('Failed to load notices', e);
     } finally {
       setIsLoadingNotices(false);
+    }
+  };
+
+  const fetchComplaints = async (status = '', category = '') => {
+    setIsLoadingComplaints(true);
+    try {
+      const params = new URLSearchParams();
+      if (status)   params.append('status',   status);
+      if (category) params.append('category', category);
+      const res = await fetch(`http://127.0.0.1:8000/api/admin/complaints?${params}`);
+      if (res.ok) setComplaints(await res.json());
+    } catch (e) {
+      console.error('Failed to load complaints', e);
+    } finally {
+      setIsLoadingComplaints(false);
+    }
+  };
+
+  const updateComplaintStatus = async (complaintId, newStatus) => {
+    setUpdatingComplaintId(complaintId);
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/admin/complaints/${complaintId}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (res.ok) {
+        // Optimistic UI update
+        setComplaints(prev => prev.map(c =>
+          c.id === complaintId
+            ? { ...c, status: newStatus,
+                status_icon: newStatus === 'open' ? '🔴' : newStatus === 'in_progress' ? '🟡' : newStatus === 'resolved' ? '🟢' : '⚫',
+                status_label: newStatus === 'open' ? 'Open' : newStatus === 'in_progress' ? 'In Progress' : newStatus === 'resolved' ? 'Resolved' : 'Dismissed' }
+            : c
+        ));
+      }
+    } catch (e) {
+      console.error('Failed to update status', e);
+    } finally {
+      setUpdatingComplaintId(null);
     }
   };
 
@@ -237,6 +285,16 @@ export default function Admin({ onBack }) {
           onClick={() => setActiveTab('notice')}
         >
           📢 Post Notice
+        </button>
+        <button
+          type="button"
+          className={`admin-tab-btn ${activeTab === 'complaints' ? 'active' : ''}`}
+          onClick={() => { setActiveTab('complaints'); fetchComplaints(complaintStatusFilter, complaintCategoryFilter); }}
+        >
+          🚨 Complaints
+          {complaints.filter(c => c.status === 'open').length > 0 && (
+            <span className="admin-tab-badge">{complaints.filter(c => c.status === 'open').length}</span>
+          )}
         </button>
       </div>
 
@@ -540,6 +598,151 @@ export default function Admin({ onBack }) {
                     );
                   })}
                 </div>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* ── Tab: Complaints ─────────────────────────────────────────────── */}
+      {activeTab === 'complaints' && (
+        <div className="admin-content-grid" style={{ gridTemplateColumns: '1fr' }}>
+          <section className="admin-card" style={{ gridColumn: '1 / -1' }}>
+            <div className="repo-header-row">
+              <div>
+                <h2>🚨 Student Complaints</h2>
+                <p className="card-desc">All complaints submitted through the chat portal</p>
+              </div>
+              <button type="button" className="refresh-repo-btn"
+                onClick={() => fetchComplaints(complaintStatusFilter, complaintCategoryFilter)}
+                disabled={isLoadingComplaints}
+              >🔄 Refresh</button>
+            </div>
+
+            {/* Filters */}
+            <div className="complaint-filters">
+              <div className="complaint-filter-group">
+                <span className="filter-label">Status:</span>
+                {['', 'open', 'in_progress', 'resolved', 'dismissed'].map(s => (
+                  <button
+                    key={s}
+                    type="button"
+                    className={`filter-chip ${complaintStatusFilter === s ? 'active' : ''}`}
+                    onClick={() => { setComplaintStatusFilter(s); fetchComplaints(s, complaintCategoryFilter); }}
+                  >
+                    {s === '' ? 'All' : s === 'in_progress' ? 'In Progress' : s.charAt(0).toUpperCase() + s.slice(1)}
+                  </button>
+                ))}
+              </div>
+              <div className="complaint-filter-group">
+                <span className="filter-label">Category:</span>
+                {['', 'hostel', 'academic', 'admin', 'facility', 'mess', 'transport', 'general'].map(c => (
+                  <button
+                    key={c}
+                    type="button"
+                    className={`filter-chip ${complaintCategoryFilter === c ? 'active' : ''}`}
+                    onClick={() => { setComplaintCategoryFilter(c); fetchComplaints(complaintStatusFilter, c); }}
+                  >
+                    {c === '' ? 'All' : c.charAt(0).toUpperCase() + c.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Complaints List */}
+            <div className="complaints-list">
+              {isLoadingComplaints ? (
+                <div className="repo-loading">Loading complaints...</div>
+              ) : complaints.length === 0 ? (
+                <div className="repo-empty">No complaints found.</div>
+              ) : (
+                complaints.map(c => (
+                  <div key={c.id} className={`complaint-admin-card complaint-status-${c.status}`}>
+                    <div className="complaint-admin-card-header">
+                      <div className="complaint-admin-card-left">
+                        <span className="complaint-admin-category-icon">{c.category_icon}</span>
+                        <div>
+                          <div className="complaint-admin-title">{c.title}</div>
+                          <div className="complaint-admin-meta">
+                            <span className="complaint-status-badge" data-status={c.status}>
+                              {c.status_icon} {c.status_label}
+                            </span>
+                            <span className="complaint-admin-scholar">
+                              🎓 {c.scholar_id || 'Unknown'}
+                            </span>
+                            <span className="complaint-admin-student">{c.student_name}</span>
+                            <span className="complaint-vote-pill">👥 {c.vote_count} {c.vote_count === 1 ? 'student' : 'students'}</span>
+                            <span className="complaint-admin-date">{formatDate(c.created_at)}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <p className="complaint-admin-description">{c.description}</p>
+
+                    {/* Hostel details if available */}
+                    {c.hostel_details && Object.keys(c.hostel_details).filter(k => !['raw_chunk','source_doc'].includes(k)).length > 0 && (
+                      <div className="complaint-admin-hostel">
+                        <div className="complaint-hostel-title">🏠 Hostel Details (auto-enriched)</div>
+                        <div className="complaint-hostel-grid">
+                          {Object.entries(c.hostel_details)
+                            .filter(([k]) => !['raw_chunk', 'source_doc'].includes(k))
+                            .slice(0, 6)
+                            .map(([k, v]) => (
+                              <div key={k} className="complaint-hostel-item">
+                                <span className="complaint-hostel-key">{k.replace(/_/g, ' ')}</span>
+                                <span className="complaint-hostel-val">{v}</span>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Status action buttons */}
+                    <div className="complaint-admin-actions">
+                      {c.status !== 'in_progress' && c.status !== 'resolved' && c.status !== 'dismissed' && (
+                        <button
+                          type="button"
+                          className="complaint-action-btn in-progress"
+                          onClick={() => updateComplaintStatus(c.id, 'in_progress')}
+                          disabled={updatingComplaintId === c.id}
+                        >
+                          🟡 Mark In Progress
+                        </button>
+                      )}
+                      {c.status !== 'resolved' && c.status !== 'dismissed' && (
+                        <button
+                          type="button"
+                          className="complaint-action-btn resolve"
+                          onClick={() => updateComplaintStatus(c.id, 'resolved')}
+                          disabled={updatingComplaintId === c.id}
+                        >
+                          🟢 Resolve
+                        </button>
+                      )}
+                      {c.status !== 'dismissed' && c.status !== 'resolved' && (
+                        <button
+                          type="button"
+                          className="complaint-action-btn dismiss"
+                          onClick={() => updateComplaintStatus(c.id, 'dismissed')}
+                          disabled={updatingComplaintId === c.id}
+                        >
+                          ⚫ Dismiss
+                        </button>
+                      )}
+                      {(c.status === 'resolved' || c.status === 'dismissed') && (
+                        <button
+                          type="button"
+                          className="complaint-action-btn reopen"
+                          onClick={() => updateComplaintStatus(c.id, 'open')}
+                          disabled={updatingComplaintId === c.id}
+                        >
+                          🔴 Reopen
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))
               )}
             </div>
           </section>

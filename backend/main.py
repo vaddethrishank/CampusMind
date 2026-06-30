@@ -23,6 +23,13 @@ from notice_agent import (
     NOTICE_ICONS,
     NOTIFY_TYPES,
 )
+from complaint_agent import (
+    classify_complaint,
+    process_complaint,
+    vote_on_complaint,
+    CATEGORY_ICONS,
+    STATUS_LABELS,
+)
 
 app = FastAPI()
 
@@ -62,6 +69,17 @@ class ResetPasswordRequest(BaseModel):
 class NoticeRequest(BaseModel):
     title: str
     content: str
+
+class ComplaintClassifyRequest(BaseModel):
+    text: str
+    user_info: Optional[Dict[str, Any]] = None
+
+class ComplaintRequest(BaseModel):
+    text: str
+    user_info: Optional[Dict[str, Any]] = None
+
+class ComplaintStatusRequest(BaseModel):
+    status: str   # open | in_progress | resolved | dismissed
 
 @app.post("/api/chat")
 async def chat(request: QueryRequest):
@@ -545,4 +563,129 @@ async def mark_all_notifications_read(user_id: str):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# ── Complaint Management Endpoints ─────────────────────────────────────────────
+
+@app.post("/api/complaint/classify")
+async def complaint_classify(req: ComplaintClassifyRequest):
+    """
+    Fast classification-only endpoint — used fire-and-forget from the frontend
+    in parallel with /api/chat.  No DB writes, no enrichment.
+    Returns {is_complaint, category, title, confidence} within ~300ms.
+    """
+    try:
+        result = classify_complaint(req.text)
+        return result
+    except Exception as e:
+        # Never propagate errors — frontend ignores failures silently
+        return {"is_complaint": False, "category": "not_complaint", "title": "", "confidence": 0.0}
+
+
+@app.post("/api/complaint")
+async def submit_complaint(req: ComplaintRequest):
+    """
+    Full complaint submission: classify → similar → hostel enrich → save.
+    Only fires when user explicitly clicks 'Submit Complaint'.
+    """
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Complaint text is required.")
+    if not req.user_info or not req.user_info.get("id"):
+        raise HTTPException(status_code=401, detail="You must be logged in to submit a complaint.")
+    try:
+        result = process_complaint(
+            text=req.text,
+            user_info=req.user_info,
+            supabase=supabase,
+        )
+        if result.get("error") == "not_a_complaint":
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Complaint submission failed: {str(e)}")
+
+
+@app.post("/api/complaint/{complaint_id}/vote")
+async def vote_complaint(complaint_id: str, req: ComplaintClassifyRequest):
+    """
+    Student agrees with / has the same issue as an existing complaint.
+    Increments vote_count, records in complaint_votes for deduplication.
+    """
+    if not req.user_info or not req.user_info.get("id"):
+        raise HTTPException(status_code=401, detail="You must be logged in to vote.")
+    try:
+        result = vote_on_complaint(complaint_id, req.user_info, supabase)
+        if result.get("error") == "already_voted":
+            raise HTTPException(status_code=409, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Vote failed: {str(e)}")
+
+
+@app.get("/api/admin/complaints")
+async def list_complaints(
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 50,
+):
+    """
+    Admin endpoint: all complaints, filterable by status and category.
+    Returns complaints with enriched icon labels.
+    """
+    try:
+        query = (
+            supabase.table("complaints")
+            .select("id, user_id, scholar_id, student_name, title, description, "
+                    "category, status, hostel_details, vote_count, created_at, updated_at")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if status:
+            query = query.eq("status", status)
+        if category:
+            query = query.eq("category", category)
+
+        res = query.execute()
+        complaints = res.data or []
+
+        # Enrich each complaint with icon/label metadata
+        for c in complaints:
+            cat  = c.get("category", "general")
+            stat = c.get("status", "open")
+            c["category_icon"]  = CATEGORY_ICONS.get(cat, "📢")
+            c["status_icon"]    = STATUS_LABELS.get(stat, ("🔴", "Open"))[0]
+            c["status_label"]   = STATUS_LABELS.get(stat, ("🔴", "Open"))[1]
+
+        return complaints
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/admin/complaints/{complaint_id}/status")
+async def update_complaint_status(complaint_id: str, req: ComplaintStatusRequest):
+    """
+    Admin action: update a complaint's status.
+    Valid values: open | in_progress | resolved | dismissed
+    """
+    valid = {"open", "in_progress", "resolved", "dismissed"}
+    if req.status not in valid:
+        raise HTTPException(status_code=400, detail=f"Status must be one of: {', '.join(valid)}")
+    try:
+        res = (
+            supabase.table("complaints")
+            .update({"status": req.status, "updated_at": "now()"})
+            .eq("id", complaint_id)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Complaint not found.")
+        return {"message": f"Status updated to '{req.status}'.", "complaint": res.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
