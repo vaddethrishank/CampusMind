@@ -15,10 +15,15 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
   const [selectedSource, setSelectedSource] = useState(null);
 
   // Complaint state
-  const [complaintPending, setComplaintPending] = useState(null); // {text, category, title}
+  const [complaintPending, setComplaintPending] = useState(null);
   const [complaintSubmitting, setComplaintSubmitting] = useState(false);
-  const [complaintResult, setComplaintResult] = useState(null);   // submitted complaint result
-  const [votedComplaints, setVotedComplaints] = useState(new Set()); // complaint IDs already voted on
+  const [complaintResult, setComplaintResult] = useState(null);
+  const [votedComplaints, setVotedComplaints] = useState(new Set());
+
+  // My Complaints panel
+  const [showMyComplaints, setShowMyComplaints] = useState(false);
+  const [myComplaints, setMyComplaints] = useState([]);
+  const [myComplaintsLoading, setMyComplaintsLoading] = useState(false);
 
   
   // Chat History State
@@ -147,6 +152,19 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
       }
     } catch (e) {
       console.error('Failed to fetch chats', e);
+    }
+  };
+
+  const fetchMyComplaints = async () => {
+    if (!user?.id) return;
+    setMyComplaintsLoading(true);
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/my-complaints?user_id=${user.id}`);
+      if (res.ok) setMyComplaints(await res.json());
+    } catch (e) {
+      console.error('Failed to fetch my complaints', e);
+    } finally {
+      setMyComplaintsLoading(false);
     }
   };
 
@@ -284,6 +302,7 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
       if (!res.ok) throw new Error(data.detail || 'Submission failed');
       setComplaintResult(data);
       setComplaintPending(null);
+      fetchMyComplaints(); // refresh my complaints panel
     } catch (err) {
       setComplaintResult({ error: err.message });
       setComplaintPending(null);
@@ -323,15 +342,69 @@ export default function Chat({ user, onLogout, onOpenAdmin }) {
           <button className="new-chat-btn" onClick={handleNewChat} style={{ flex: 1, marginBottom: 0 }}>
             + New Chat
           </button>
-          <button 
-            type="button" 
-            onClick={onOpenAdmin} 
+          <button
+            type="button"
+            onClick={onOpenAdmin}
             className="admin-nav-btn"
             title="Institutional Admin Portal"
           >
             🛡️ Admin
           </button>
         </div>
+
+        {/* My Complaints toggle button */}
+        <button
+          type="button"
+          className={`my-complaints-btn ${showMyComplaints ? 'active' : ''}`}
+          onClick={() => {
+            setShowMyComplaints(v => !v);
+            if (!showMyComplaints) fetchMyComplaints();
+          }}
+        >
+          <span>🚨 My Complaints</span>
+          {myComplaints.filter(c => c.status === 'open' || c.status === 'in_progress').length > 0 && (
+            <span className="my-complaints-count">
+              {myComplaints.filter(c => c.status === 'open' || c.status === 'in_progress').length}
+            </span>
+          )}
+        </button>
+
+        {/* My Complaints panel */}
+        {showMyComplaints && (
+          <div className="my-complaints-panel">
+            {myComplaintsLoading ? (
+              <div className="my-complaints-loading">Loading…</div>
+            ) : myComplaints.length === 0 ? (
+              <div className="my-complaints-empty">No complaints submitted yet.</div>
+            ) : (
+              myComplaints.map(c => (
+                <div key={c.id} className={`my-complaint-item status-${c.status}`}>
+                  <div className="my-complaint-header">
+                    <span className="my-complaint-cat-icon">{c.category_icon}</span>
+                    <span className="my-complaint-title">{c.title}</span>
+                  </div>
+                  <div className="my-complaint-meta">
+                    <span className="my-complaint-status-badge" data-status={c.status}>
+                      {c.status_icon} {c.status_label}
+                    </span>
+                    <span className="my-complaint-votes">👥 {c.vote_count}</span>
+                    <span className="my-complaint-date">
+                      {(() => {
+                        const diff = Date.now() - new Date(c.created_at).getTime();
+                        const mins = Math.floor(diff / 60000);
+                        if (mins < 1) return 'Just now';
+                        if (mins < 60) return `${mins}m ago`;
+                        const hrs = Math.floor(mins / 60);
+                        if (hrs < 24) return `${hrs}h ago`;
+                        return `${Math.floor(hrs / 24)}d ago`;
+                      })()}
+                    </span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
         <div className="chat-history-list">
           {chatSessions.map((chat) => (
             <div 

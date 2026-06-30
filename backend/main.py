@@ -626,6 +626,32 @@ async def vote_complaint(complaint_id: str, req: ComplaintClassifyRequest):
         raise HTTPException(status_code=500, detail=f"Vote failed: {str(e)}")
 
 
+@app.get("/api/my-complaints")
+async def get_my_complaints(user_id: str):
+    """Return all complaints submitted by a specific student, newest first."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        res = (
+            supabase.table("complaints")
+            .select("id, title, description, category, status, vote_count, hostel_details, created_at, updated_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        complaints = res.data or []
+        for c in complaints:
+            cat  = c.get("category", "general")
+            stat = c.get("status", "open")
+            c["category_icon"] = CATEGORY_ICONS.get(cat, "📢")
+            c["status_icon"]   = STATUS_LABELS.get(stat, ("🔴", "Open"))[0]
+            c["status_label"]  = STATUS_LABELS.get(stat, ("🔴", "Open"))[1]
+        return complaints
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/admin/complaints")
 async def list_complaints(
     status: Optional[str] = None,
