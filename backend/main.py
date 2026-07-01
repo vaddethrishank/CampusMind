@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Any, Dict, Optional, List
@@ -30,8 +30,13 @@ from complaint_agent import (
     CATEGORY_ICONS,
     STATUS_LABELS,
 )
+from telegram_bot import handle_update, setup_webhook
 
 app = FastAPI()
+
+@app.on_event("startup")
+async def on_startup():
+    await setup_webhook()
 
 app.add_middleware(
     CORSMiddleware,
@@ -714,4 +719,18 @@ async def update_complaint_status(complaint_id: str, req: ComplaintStatusRequest
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook(
+    background_tasks: BackgroundTasks,
+    update: dict = Body(...)
+):
+    """
+    Telegram sends every message here via HTTPS POST.
+    We return 200 immediately (required by Telegram protocol),
+    and process the update in a background task so latency is ~0ms.
+    """
+    background_tasks.add_task(handle_update, update, supabase)
+    return {"ok": True}
 

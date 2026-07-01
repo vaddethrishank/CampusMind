@@ -207,6 +207,7 @@ def dispatch_notifications(
     title: str,
     message_template: str,
     supabase,
+    doc_type: str = "general"
 ) -> int:
     """
     Bulk-insert one user_notifications row per user.
@@ -236,6 +237,29 @@ def dispatch_notifications(
         for i in range(0, len(rows), BATCH):
             supabase.table("user_notifications").insert(rows[i : i + BATCH]).execute()
         print(f"[NoticeAgent] Dispatched {len(rows)} notifications for notice {notice_id}")
+        
+        # Push to Telegram for linked users
+        try:
+            from telegram_bot import send_telegram_push
+            if os.environ.get("TELEGRAM_BOT_TOKEN"):
+                user_ids = [u["id"] for u in users]
+                tg_profiles = (
+                    supabase.table("profiles")
+                    .select("id, name, telegram_chat_id")
+                    .in_("id", user_ids)
+                    .not_.is_("telegram_chat_id", "null")
+                    .execute()
+                ).data or []
+
+                icon = NOTICE_ICONS.get(doc_type, "📢")
+                for p in tg_profiles:
+                    name = p.get("name", "Student")
+                    msg  = message_template.replace("{name}", name)
+                    send_telegram_push(p["telegram_chat_id"], title, msg, icon)
+                print(f"[NoticeAgent] Telegram push sent to {len(tg_profiles)} users")
+        except Exception as e:
+            print(f"[NoticeAgent] Telegram push error (non-fatal): {e}")
+
         return len(rows)
     except Exception as e:
         print(f"[NoticeAgent] dispatch_notifications error: {e}")
